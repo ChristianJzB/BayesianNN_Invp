@@ -1,0 +1,306 @@
+import sys
+import os
+import argparse
+import numpy as np
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+sys.path.append(project_root)  # This allows importing from base, Elliptic, etc.
+sys.path.append(os.path.join(project_root, "navier_stokes"))  # Explicitly add Elliptic folder
+
+from navier_stokes.experiments.models_config import *
+from navier_stokes.experiments.experiment_utilities import *
+# Main experiment runner
+def run_experiment(config_experiment,config_model,device):
+
+    eval_save = True if config_experiment.model_type == "fem" else False
+
+    paths = build_paths(config_model)
+    
+    model_name, model = get_models(config_experiment,config_model, paths, device)
+
+    sampler ,obs_points, sol_test = get_sampler(model,config_experiment,device)
+
+    #for i in range(config_experiment.repeat):
+    if config_experiment.mcmc:
+        print(f"Running MCMC for {model_name}")
+        sampler.run_chain(verbose = config_experiment.verbose)           
+        np.save(paths[f"{model_name}_mcmc"].format(i=0), sampler.mcmc_samples[sampler.burnin:,:].cpu().numpy())
+
+        if eval_save:
+            np.save(paths[f"{model_name}_mcmc_eval"].format(i=0), sampler.lh_mcmc_evaluations[sampler.burnin:,:].cpu().numpy())
+
+        if not config_experiment.marginal_approximation and not config_experiment.model_type == "fem":
+            np.save(paths[f"{model_name}_mean_proposal"], sampler.dt.cpu().numpy())
+
+    if config_experiment.da:
+        print(f"Running MCMC/DA for {model_name}") 
+        if config_experiment.marginal_approximation:
+            mean_dt = np.load(paths[f"{model_name}_mean_proposal"])
+            sampler.dt = torch.tensor(mean_dt)
+
+        sampler.run_da(verbose = config_experiment.verbose)                
+        np.save(paths[f"{model_name}_da"].format(i=0), sampler.da_acc_rej.cpu().numpy())
+        np.save(paths[f"{model_name}_da_chain"].format(i=0), sampler.fine_model_chain.cpu().numpy())
+
+
+
+    if config_experiment.alpha_eval:
+        print(f"Computing Error, Alpha and Time for {model_name}") 
+        error_eval(model,model_name,config_experiment,config_model,obs_points,sol_test,paths,device)       
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Run Elliptic Experiment")
+    parser.add_argument("--verbose", action="store_true", help="Verbose")
+    parser.add_argument("--model_type", type=str,default="dgala",required=True, help="Surrogate type")
+    parser.add_argument("--kl", type=int,default=1,help="KL_expansion")
+
+    parser.add_argument("--dgala", action="store_true", help="Fit DeepGala")
+    parser.add_argument("--N", type=int, required=True, help="Number of training samples per chunk")
+    parser.add_argument("--hidden_layers", type=int,default=3, help="Number of hidden layers of the NN")
+    parser.add_argument("--num_neurons", type=int,default=300, help="Number of neurons per layer")
+    parser.add_argument("--batch_size", type=int,default=10,help="Mini batche size")
+
+    parser.add_argument("--proposal", type=str,default="random_walk",help="MCMC Proposal")
+    parser.add_argument("--marginal_approximation", action="store_true", help="Run DA-MCMC for NN")
+    parser.add_argument("--mcmc", action="store_true", help="Run MCMC")
+    parser.add_argument("--da", action="store_true", help="Run DA-MCMC")
+    parser.add_argument("--mcmc_samples", type=int,default=2_500_000,help="#Samples for the MCMC")
+    parser.add_argument("--da_eval", type=int,default=5_000,help="#Evaluations for the DA-MCMC")
+    parser.add_argument("--alpha_eval", action="store_true",help="Computes Alpha, Error and Time")
+
+    parser.add_argument("--repeat", type=int,default=3, help="Repeat MCMC ntimes")
+    args = parser.parse_args()
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    if args.model_type == "dgala":
+        config_model = nv_experiment(args.N,args.hidden_layers,args.num_neurons,args.batch_size,args.kl,
+                                                args.dgala,marginal = args.marginal_approximation)
+
+    # Pass all arguments
+    config_experiment = nv_inverse_problem(args.model_type,args.verbose,args.dgala,args.mcmc,args.da,
+                            args.marginal_approximation,args.alpha_eval,args.kl,args.proposal,
+                            args.mcmc_samples,args.da_eval, args.repeat)
+    
+    config_model.seed = config_experiment.seed
+
+    run_experiment(config_experiment,config_model,device)
+
+# import sys
+# import os
+# import torch
+# import wandb
+# import argparse
+# import numpy as np
+# import json
+
+# from ml_collections import ConfigDict
+
+# project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+# sys.path.append(project_root)  # This allows importing from base, Elliptic, etc.
+# sys.path.append(os.path.join(project_root, "Navier-Stokes"))  # Explicitly add Elliptic folder
+
+
+# from Base.lla import dgala
+# from Base.utilities import clear_hooks, Timer
+# from nv_files.nv_mcmc import NVMCMC, NVMCMCDA
+# from nv_files.train_nvs import train_vorticity_dg,train_vorticity_epoch
+# from nv_files.utilities import generate_noisy_obs,deepgala_data_fit
+
+
+
+# # Helper function to set up MCMC chain
+# def run_mcmc_chain(surrogate_model, obs_points, sol_test, config_experiment,device):
+#     mcmc = NVMCMC(
+#         surrogate=surrogate_model,
+#         observation_locations=obs_points,
+#         observations_values=sol_test,
+#         observation_noise=np.sqrt(config_experiment.noise_level),
+#         nparameters=2*config_experiment.KL_expansion,
+#         nsamples=config_experiment.samples,
+#         proposal_type=config_experiment.proposal,
+#         step_size=config_experiment.proposal_variance,
+#         uniform_limit = config_experiment.uniform_limit,
+#         device=device
+#     )
+#     return mcmc.run_chain(verbose=config_experiment.verbose)
+
+# def run_da_mcmc_chain(nn_surrogate_model, obs_points, sol_test,obs_indices, config_experiment,device):
+#     da_mcmc = NVMCMCDA(nn_surrogate_model,observation_locations= obs_points, observations_values = sol_test, 
+#                         nparameters=2*config_experiment.KL_expansion,observation_noise=np.sqrt(config_experiment.noise_level),
+#                         fs_n = config_experiment.fs_n, fs_T=config_experiment.fs_T,fs_steps =config_experiment.fs_steps,
+#                         fs_indices_sol=obs_indices,iter_mcmc=config_experiment.iter_mcmc, iter_da = config_experiment.iter_da,
+#                         proposal_type=config_experiment.proposal,step_size=config_experiment.proposal_variance,
+#                         uniform_limit = config_experiment.uniform_limit, device=device )
+
+#     return da_mcmc.run_chain(verbose=config_experiment.verbose)
+
+# # Main experiment runner
+# def run_experiment(config_experiment,device):
+
+#     # Model Paths
+#     model_specific = f"_hl{config_experiment.model.num_layers}_n{config_experiment.model.hidden_dim}_s{config_experiment.points_per_chunk}_bs{config_experiment.batch_size}_kl{config_experiment.KL_expansion}"
+#     nn_path_model = "./Navier-Stokes/models/vorticity" + model_specific + ".pth"
+#     dgala_path_model = "./Navier-Stokes/models/nv_dgala" + model_specific + ".pth"
+#     times = dict()
+
+#     # Step 1: Training Phase (if needed)
+#     if config_experiment.train:
+#         print(f"Running training with the specifics" + model_specific)
+#         config_experiment.wandb.name = "vorticity" + model_specific
+#         config_experiment.batch_ic = 16*config_experiment.points_per_chunk
+        
+#         config_experiment.model.input_dim = 3 + 2*config_experiment.KL_expansion
+#         config_experiment.model.fourier_emb["exclude_last_n"] = 2*config_experiment.KL_expansion
+        
+#         train_timer = Timer(use_gpu=True)
+#         train_timer.start()
+#         pinn_nvs = train_vorticity_epoch(config_experiment, device=device)
+#         ttrain = train_timer.stop()
+#         times["train"] = ttrain
+
+#         print(f"Completed training with {config_experiment.points_per_chunk} samples.")
+
+#     # Step 2: Fit deepGALA
+#     if config_experiment.deepgala:
+#         print("Starting DeepGaLA fitting for NN" + model_specific)
+#         config_experiment.batch_ic = 16*config_experiment.points_per_chunk
+
+#         nn_surrogate_model = torch.load(nn_path_model, map_location=device)
+#         nn_surrogate_model.eval()
+#         nn_surrogate_model.to(device)
+#         nn_surrogate_model.M = nn_surrogate_model.M.to(device)
+
+#         dgala_timer = Timer(use_gpu=True)
+#         dgala_timer.start()
+#         data_fit = deepgala_data_fit(config_experiment, device)
+
+#         llp = dgala(nn_surrogate_model)
+#         llp.fit(data_fit)
+#         llp.optimize_marginal_likelihood(error_tolerance=1e-4, max_iter=5000)
+#         clear_hooks(llp)
+
+#         tdagala = dgala_timer.stop()
+#         times["deepgala"] = tdagala
+
+#         torch.save(llp, dgala_path_model)
+
+#     # Step 3: Generate noisy observations for Inverse Problem
+#     obs_points, sol_test, obs_indices,_ = generate_noisy_obs(obs=config_experiment.num_observations,
+#                                               noise_level=config_experiment.noise_level,
+#                                               NKL = config_experiment.KL_expansion)
+#     print(config_experiment.noise_level)
+
+#     # Step 4: Neural Network Surrogate for MCMC
+#     if config_experiment.nn_mcmc:
+#         print(f"Starting {config_experiment.proposal}-MCMC with NN" + model_specific)
+#         nn_surrogate_model = torch.load(nn_path_model, map_location=device)
+#         nn_surrogate_model.eval()
+
+#         mcmc_timer = Timer(use_gpu=True)
+#         mcmc_timer.start()
+#         nn_samples = run_mcmc_chain(nn_surrogate_model, obs_points, sol_test, config_experiment,device)
+#         tmcmc = mcmc_timer.stop()
+#         times["nn_mcmc"] = tmcmc
+
+#         np.save("./Navier-Stokes/results/nn" + model_specific + f"_var{config_experiment.noise_level}.npy", nn_samples[0])
+    
+#     # Step 5: DeepGaLA Surrogate for MCMC
+#     if config_experiment.dgala_mcmc:
+#         print(f"Starting {config_experiment.proposal}-MCMC with DeepGaLA" + model_specific)
+#         llp = torch.load(dgala_path_model, map_location=device)
+#         llp.model.set_last_layer("output_layer")  # Re-register hooks
+#         llp._device = device
+
+#         mcmcdg_timer = Timer(use_gpu=True)
+#         mcmcdg_timer.start()
+#         nn_samples = run_mcmc_chain(llp, obs_points, sol_test, config_experiment, device)
+#         tdgmcmc = mcmcdg_timer.stop()
+#         times["dgala_mcmc"] = tdgmcmc
+        
+#         np.save("./Navier-Stokes/results/dgala" + model_specific + f"_var{config_experiment.noise_level}.npy", nn_samples[0])
+
+#     # Step 7: Delayed Acceptance for NN
+#     if config_experiment.da_mcmc_nn:
+#         print(f"Starting {config_experiment.proposal}-MCMC-DA with NN" + model_specific + "and PSM")
+#         nn_surrogate_model = torch.load(nn_path_model, map_location=device)
+#         nn_surrogate_model.eval()
+
+#         results = run_da_mcmc_chain(nn_surrogate_model, obs_points, sol_test, obs_indices, config_experiment, device)
+
+#         nn_samples,acceptance_res,proposal_thetas,lh_val_nn,lh_val_solver,tmcmc,tda = results
+#         times["nn_mcmc"] = tmcmc
+#         times["nn_da"] = tda
+        
+#         np.save("./Navier-Stokes/results/nn" + model_specific + f"_var{config_experiment.noise_level}.npy", nn_samples)
+#         np.save("./Navier-Stokes/results/mcmc_da_nn" + model_specific + f"_var{config_experiment.noise_level}.npy", acceptance_res)
+#         np.save("./Navier-Stokes/results/mcmc_da_nn_proposal_thetas" + model_specific + f"_var{config_experiment.noise_level}.npy", proposal_thetas)
+#         np.save("./Navier-Stokes/results/mcmc_da_nn_lh_nn" + model_specific + f"_var{config_experiment.noise_level}.npy", lh_val_nn)
+#         np.save("./Navier-Stokes/results/mcmc_da_nn_lh_solver" + model_specific + f"_var{config_experiment.noise_level}.npy", lh_val_solver)
+
+#     # Step 8: Delayed Acceptance for Dgala
+#     if config_experiment.da_mcmc_dgala:
+#         print(f"Starting {config_experiment.proposal}-MCMC-DA with DGALA" + model_specific + "and PSM")
+
+#         llp = torch.load(dgala_path_model, map_location=device)
+#         llp.model.set_last_layer("output_layer")  # Re-register hooks
+#         llp._device = device
+
+#         results = run_da_mcmc_chain(llp, obs_points, sol_test,obs_indices, config_experiment, device)
+
+#         nn_samples,acceptance_res,proposal_thetas,lh_val_nn,lh_val_solver,tmcmc,tda =results
+#         times["dgala_mcmc"] = tmcmc
+#         times["dgala_da"] = tda
+
+#         np.save("./Navier-Stokes/results/dgala" + model_specific + f"_var{config_experiment.noise_level}.npy", nn_samples)
+#         np.save("./Navier-Stokes/results/mcmc_da_dgala" + model_specific + f"_var{config_experiment.noise_level}.npy", acceptance_res)
+
+#     with open(f'./Navier-Stokes/results/times/timing_nn'+ model_specific+ '.json', 'w') as f:
+#             json.dump(times, f, indent=4)  # indent for readability
+            
+# # Main loop for different sample sizes
+# def main(verbose,N,hidden_layers,num_neurons,batch_size,kl,train,
+#          deepgala,noise_level,proposal,nn_mcmc,dgala_mcmc,da_mcmc_nn,da_mcmc_dgala, device):
+#     config_experiment = nv_experiment()
+#     config_experiment.verbose = verbose
+#     config_experiment.points_per_chunk = N
+#     config_experiment.model.num_layers = hidden_layers 
+#     config_experiment.model.hidden_dim = num_neurons
+#     config_experiment.batch_size = batch_size
+#     config_experiment.KL_expansion = kl
+#     config_experiment.train = train
+#     config_experiment.deepgala = deepgala
+#     config_experiment.noise_level = noise_level
+#     config_experiment.proposal = proposal
+#     config_experiment.nn_mcmc = nn_mcmc
+#     config_experiment.dgala_mcmc = dgala_mcmc
+#     config_experiment.da_mcmc_nn = da_mcmc_nn
+#     config_experiment.da_mcmc_dgala = da_mcmc_dgala
+#     run_experiment(config_experiment,device)
+
+# if __name__ == "__main__":
+
+#     parser = argparse.ArgumentParser(description="Run Elliptic Experiment")
+#     parser.add_argument("--verbose", action="store_true", help="Verbose")
+#     parser.add_argument("--N", type=int, required=True, help="Number of training samples per chunk")
+#     parser.add_argument("--hidden_layers", type=int,default=3, help="Number of hidden layers of the NN")
+#     parser.add_argument("--num_neurons", type=int,default=200, help="Number of neurons per layer")
+#     parser.add_argument("--batch_size", type=int,default=16*10, help="Number of neurons per layer")
+#     parser.add_argument("--kl", type=int,default=1, help="KL expansion for RF")
+#     parser.add_argument("--train", action="store_true", help="Train NN")
+#     parser.add_argument("--deepgala", action="store_true", help="Fit DeepGala")
+#     parser.add_argument("--noise_level", type=float,default=1e-3,help="Noise level for IP")
+#     parser.add_argument("--proposal", type=str,default="random_walk",help="MCMC Proposal")
+#     parser.add_argument("--nn_mcmc", action="store_true", help="Run MCMC for NN")
+#     parser.add_argument("--dgala_mcmc", action="store_true", help="Run MCMC for dgala")
+#     parser.add_argument("--da_mcmc_nn", action="store_true", help="Run DA-MCMC for NN")
+#     parser.add_argument("--da_mcmc_dgala", action="store_true", help="Run DA-MCMC for DeepGala")
+
+#     args = parser.parse_args()
+
+#     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+#     # Pass all arguments
+#     main(args.verbose, args.N, args.hidden_layers, args.num_neurons,args.batch_size,args.kl,args.train, 
+#          args.deepgala, args.noise_level, args.proposal,args.nn_mcmc, args.dgala_mcmc, args.da_mcmc_nn, args.da_mcmc_dgala, device)
