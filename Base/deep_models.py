@@ -35,7 +35,7 @@ class PeriodEmbs(nn.Module):
 
         # Store period parameters as constants (non-trainable)
         for idx, p in enumerate(period):
-            self.register_buffer(f"period_{idx}", torch.tensor(p, dtype=torch.float32))
+            self.register_buffer(f"period_{idx}", torch.tensor(p, dtype=torch.float64))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -75,21 +75,27 @@ class FourierEmbs(nn.Module):
         
         # Initialize the trainable kernel for the Fourier embedding
         self.kernel = nn.Parameter(torch.empty(self.embedded_axes, embed_dim // 2))
-        self._initialize_kernel()
-
-    def _initialize_kernel(self):
-        """Custom initialization for the kernel."""
         nn.init.normal_(self.kernel, mean=0.0, std=self.embed_scale)
+
+        # projection ensures output_dim = input_dim
+        #self.proj = nn.Linear(embed_dim, self.embedded_axes)
+
+        # self._initialize_kernel()
+
+    # def _initialize_kernel(self):
+    #     """Custom initialization for the kernel."""
+    #     nn.init.normal_(self.kernel, mean=0.0, std=self.embed_scale)
 
     def forward(self, x):
         """Compute Fourier embeddings, excluding the last `exclude_last_n` elements along the given axis."""
         
-        # If exclude_last_n is 0, apply Fourier embeddings to the entire tensor
-        if self.exclude_last_n == 0:
-            xi = x  # No exclusion, apply Fourier transformation to all columns
-        else:
-            # Select all columns except the last `exclude_last_n` columns
-            xi = x[..., :-self.exclude_last_n]  # This selects all but the last `exclude_last_n` columns
+        # # If exclude_last_n is 0, apply Fourier embeddings to the entire tensor
+        # if self.exclude_last_n == 0:
+        #     xi = x  # No exclusion, apply Fourier transformation to all columns
+        # else:
+        #     # Select all columns except the last `exclude_last_n` columns
+        #     xi = x[..., :-self.exclude_last_n]  # This selects all but the last `exclude_last_n` columns
+        xi = x[..., :-self.exclude_last_n] if self.exclude_last_n > 0 else x
 
         # Compute the dot product of xi with the kernel
         transformed = torch.matmul(xi, self.kernel)
@@ -97,13 +103,25 @@ class FourierEmbs(nn.Module):
         # Apply sine and cosine transformations
         fourier_emb = torch.cat((torch.cos(transformed), torch.sin(transformed)), dim=-1)
 
-        # Reconstruct the full output tensor by concatenating Fourier embeddings with the remaining columns
+        # ✔ project back to original dimension of xi
+        #xi_proj = self.proj(fourier_emb)
+
+        # append untouched remainder
         if self.exclude_last_n > 0:
-            remaining = x[..., -self.exclude_last_n:]  # This selects the last `exclude_last_n` columns
-            y = torch.cat((fourier_emb, remaining), dim=-1)
+            remaining = x[..., -self.exclude_last_n:]
+            y = torch.cat([fourier_emb, remaining], dim=-1)
         else:
-            y = fourier_emb  # No exclusion, just return the Fourier embeddings
+            y = fourier_emb
+
         return y
+
+        # # Reconstruct the full output tensor by concatenating Fourier embeddings with the remaining columns
+        # if self.exclude_last_n > 0:
+        #     remaining = x[..., -self.exclude_last_n:]  # This selects the last `exclude_last_n` columns
+        #     y = torch.cat((fourier_emb, remaining), dim=-1)
+        # else:
+        #     y = fourier_emb  # No exclusion, just return the Fourier embeddings
+        # return y
 
 def _weight_fact(kernel_init, mean=1.0, stddev=0.1, shape=None):
     # Function to initialize weights with factorization
@@ -232,7 +250,7 @@ class MDNN(nn.Module):
             self.fourier_emb["input_dim"] = self.input_dim
             self.fourier_layer = FourierEmbs(**self.fourier_emb)
             self.input_dim = self.fourier_emb['embed_dim'] + self.fourier_emb["exclude_last_n"]
-            self.hidden_dim += self.fourier_emb["exclude_last_n"]
+            #self.hidden_dim += self.fourier_emb["exclude_last_n"]
 
         # Define the first layer for u and v components
         if self.reparam:
@@ -241,6 +259,7 @@ class MDNN(nn.Module):
         else:
             self.u_layer = nn.Linear(self.input_dim, self.hidden_dim)
             self.v_layer = nn.Linear(self.input_dim, self.hidden_dim)
+
 
         # Define hidden layers dynamically
         self.hidden_layers = nn.ModuleList([

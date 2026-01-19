@@ -395,8 +395,6 @@ def discrete_W1(chain_nn,chain_fem):
 def error_norm_mean(surrogate, fine_model_eval,observation_locations,samples,device,gp=False, scikit = False):
     total_error = 0
     for fine_eval,theta in zip(fine_model_eval,samples):
-        fine_pred = torch.tensor(fine_eval,device=device)
-
         if gp:
             surrogate_pred = surrogate.prediction(theta.reshape(1,-1),var=False)
         elif scikit:
@@ -406,7 +404,7 @@ def error_norm_mean(surrogate, fine_model_eval,observation_locations,samples,dev
             data = torch.cat([observation_locations, theta.repeat(observation_locations.size(0), 1)], dim=1).float()
             surrogate_pred = surrogate.u(data.float()).detach()
 
-        error = (torch.linalg.norm((fine_pred.reshape(-1,1)-surrogate_pred.reshape(-1,1)),ord=2)**2).item()
+        error = (torch.linalg.norm((fine_eval.reshape(-1,1)-surrogate_pred.reshape(-1,1)),ord=2)**2).item()
         total_error += error
 
     return np.sqrt(total_error / samples.shape[0])
@@ -414,8 +412,6 @@ def error_norm_mean(surrogate, fine_model_eval,observation_locations,samples,dev
 def error_norm_marginal(surrogate, fine_model_eval,observation_locations,samples, device, gp=False):
     total_error = 0
     for fine_eval,theta in zip(fine_model_eval,samples):
-        fine_pred = torch.tensor(fine_eval, device=device)
-
         if gp:
             mean_surg, var_surg = surrogate.prediction(theta.reshape(1,-1),var=True)
             var_surg = torch.diag(var_surg)
@@ -424,9 +420,9 @@ def error_norm_marginal(surrogate, fine_model_eval,observation_locations,samples
             data = torch.cat([observation_locations, theta.repeat(observation_locations.size(0), 1)], dim=1).float()
             mean_surg, var_surg = surrogate(data.float())
             mean_surg = mean_surg.view(-1, 1).detach()
-            var_surg = var_surg[:, :, 0].view(-1, 1).detach()
+            var_surg = torch.diag(var_surg[:, :, 0]).detach()
         
-        error_mean = torch.linalg.norm((fine_pred.reshape(-1,1)-mean_surg.reshape(-1,1)),ord=2)**2
+        error_mean = torch.linalg.norm((fine_eval.reshape(-1,1)-mean_surg.reshape(-1,1)),ord=2)**2
         error_var = torch.sum(var_surg)
         error = torch.sqrt(error_mean + error_var)
         total_error += error.item()

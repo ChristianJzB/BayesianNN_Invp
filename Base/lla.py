@@ -70,7 +70,7 @@ class dgala(torch.nn.Module):
     @property
     def _H_factor(self):
         sigma2 = self.sigma_noise.square()
-        return 1 / sigma2 / self.temperature
+        return 1 / (2*sigma2) / self.temperature
     
     @property
     def prior_precision_diag(self):
@@ -128,9 +128,10 @@ class dgala(torch.nn.Module):
             # Compute the normalizer term for Gaussian likelihood
             n_data_key = self.n_data[key]  # Number of data points for this key
             normalizer = n_data_key * torch.log(self.sigma_noise*sqrt(2*pi))
+            weight = self.dgala.lambdas[key]
 
             # Compute log likelihood contribution for this key
-            log_likelihood_key = factor *n_data_key* loss_value - normalizer
+            log_likelihood_key = factor *n_data_key* loss_value*weight - normalizer
 
             # Accumulate total log likelihood
             total_log_likelihood += log_likelihood_key
@@ -179,6 +180,8 @@ class dgala(torch.nn.Module):
     
     def full_Hessian(self,fit_data):
         parameters_ = list(self.dgala.model.output_layer.parameters())
+        h = torch.zeros(self.n_params,self.n_params,device = self._device)
+        damping = torch.eye(self.n_params,device=self._device)
 
         for key,dt_fit in fit_data["data_fit"].items():
             dt_fit = dt_fit[1] if isinstance(dt_fit, tuple) else dt_fit
@@ -187,17 +190,39 @@ class dgala(torch.nn.Module):
                 self.dgala.model.zero_grad()
                 fout = getattr(self.dgala, clm)(dt_fit)
                 #damping_factor = 1e-5 if key =="pde" else 1
-                #damping = torch.eye(self.n_params,device=self._device)*damping_factor
 
                 if isinstance(fout, tuple):  # Check if fout is a tuple
                     for i, f_out_indv in enumerate(fout):  # Iterate over fout if it's a tuple
                         indv_h = self.compute_hessian(f_out_indv,parameters_,key)
-                        self. H += indv_h*self.dgala.lambdas[fit_data["outputs"][key][i]]
+                        h+= indv_h*self.dgala.lambdas[fit_data["outputs"][key][i]]
                         self.n_data[fit_data["outputs"][key][i]] = f_out_indv.shape[0]
                 else:
                     indv_h = self.compute_hessian(fout,parameters_,key)
-                    self. H += indv_h*self.dgala.lambdas[fit_data["outputs"][key][z]]
+                    h += indv_h*self.dgala.lambdas[fit_data["outputs"][key][z]]
                     self.n_data[fit_data["outputs"][key][z]] = fout.shape[0]
+                
+        # eigvals, eigvecs = torch.linalg.eigh(h)
+        # #eigvals_clamped = torch.clamp(eigvals, min=0.0)
+        # #hessian_psd = eigvecs @ torch.diag(eigvals_clamped) @ eigvecs.T
+        # #hessian_psd = 0.5 * (hessian_psd + hessian_psd.T)
+
+        # negative_eigvals = eigvals[eigvals < 0]
+
+        # if len(negative_eigvals) > 0:
+        #     largest_negative = -negative_eigvals.min()
+        # else:
+        #     largest_negative = 0  # or handle case with no negative eigenvalues
+
+        # # hessian_loss += (largest_negative + 1e-10)*damping
+        # # choose eps relative to largest eigenvalue
+        # α = 1e-7  # float32
+        # eps = α * eigvals.abs().max()
+
+        # print(f"Largest negative eigenvalue {largest_negative}")
+        # self.H = h + (largest_negative + eps)*damping
+        self.H += h
+
+
                 
     def compute_hessian (self,output,parameters_,key):
         hessian_loss = torch.zeros(self.n_params,self.n_params,device = self._device)
@@ -214,7 +239,7 @@ class dgala(torch.nn.Module):
 
             reshaping_grads = [g.reshape(ndim,-1) for g in grad_p]
             # Concatenate along the parameter axis
-            jacobian_matrix = torch.cat(reshaping_grads, dim=1)
+            jacobian_matrix = torch.cat(reshaping_grads, dim=1).reshape(1,-1)
             h_indv = jacobian_matrix.T @ jacobian_matrix
             hessian_loss +=  h_indv 
             if self.chunks and (i + 1) % nitems_chunk == 0 and key == "pde":
@@ -222,30 +247,35 @@ class dgala(torch.nn.Module):
                 hessian_loss *= self.gamma[chunk_counter]
                 chunk_counter += 1
 
-        eigvals = torch.linalg.eigvalsh(hessian_loss)
+        # Compute eigen-decomposition
+        eigvals, eigvecs = torch.linalg.eigh(hessian_loss)
+
+        # # Clamp negative eigenvalues to zero
+        eigvals_clamped = torch.clamp(eigvals, min=0.0)
+
+        # # Reconstruct the PSD Hessian
+        hessian_psd = eigvecs @ torch.diag(eigvals_clamped) @ eigvecs.T
+
         negative_eigvals = eigvals[eigvals < 0]
 
         if len(negative_eigvals) > 0:
             largest_negative = -negative_eigvals.min()
         else:
-            largest_negative = None  # or handle case with no negative eigenvalues
-        hessian_loss += (largest_negative + 1e-10)*damping
+            largest_negative = 0  # or handle case with no negative eigenvalues
 
         print(f"Largest negative eigenvalue {largest_negative}")
-        return hessian_loss
+        return hessian_psd
         
-
     def __call__(self, x):
         """Compute the posterior predictive on input data `X`."""
         f_mu, f_var = self._glm_predictive_distribution(x)
         return f_mu, f_var
 
-
     def _glm_predictive_distribution(self, X):
         Js, f_mu = self.last_layer_jacobians(X)
         f_var = self.functional_variance(Js)
-        if f_mu.shape[-1] > 1:
-            f_var = torch.diagonal(f_var, dim1 = 1, dim2 = 2)
+        # if f_mu.shape[-1] > 1:
+        #     f_var = torch.diagonal(f_var, dim1 = 1, dim2 = 2)
         return f_mu.detach(), f_var.detach()
 
     def last_layer_jacobians(self, x):
@@ -267,8 +297,8 @@ class dgala(torch.nn.Module):
     
 
     def functional_variance(self, Js: torch.Tensor) -> torch.Tensor:
-        return torch.einsum('ncp,pq,nkq->nck', Js, self.posterior_covariance, Js)
-    
+        #return torch.einsum('ncp,pq,nkq->nck', Js, self.posterior_covariance, Js)
+        return torch.einsum("bdi,ij,cdj->bcd", Js,self.posterior_covariance, Js)
   
     def log_marginal_likelihood(self, prior_precision=None, sigma_noise=None):
         """Compute the Laplace approximation to the log marginal likelihood
@@ -283,32 +313,44 @@ class dgala(torch.nn.Module):
 
         return self.log_likelihood - 0.5 * (self.log_det_ratio + self.scatter)
     
-    def optimize_marginal_likelihood(self, error_tolerance=1e-3, max_iter=300, lr=1e-2):
+    def optimize_marginal_likelihood(self, error_tolerance=1e-6, max_iter=300, lr=1e-2):
         """Optimize the log prior and log sigma by maximizing the marginal likelihood."""
         #log_prior_prec = self.prior_precision.log().requires_grad_(True)
 
-        log_sigma_noise = self.sigma_noise.log().requires_grad_(True)
+        #log_sigma_noise = self.sigma_noise.log().requires_grad_(True)
         log_prior_prec = self.prior_precision.log().requires_grad_(True)
 
-        hyper_optimizer = torch.optim.Adam([log_prior_prec, log_sigma_noise], lr=lr)
-
+        #hyper_optimizer = torch.optim.Adam([log_prior_prec, log_sigma_noise], lr=lr)
+        
+        hyper_optimizer = torch.optim.Adam([log_prior_prec], lr=lr)
         error,n_iter = float('inf'),0  # Initialize error
+
+        sigma_trace = []
+        prior_trace = []
+        marglik_trace = []
 
         while error > error_tolerance and n_iter < max_iter:
             #prev_log_prior, prev_log_sigma = log_prior_prec.detach().clone(), log_sigma_noise.detach().clone()
-            prev_log_prior, prev_log_sigma = log_prior_prec.detach().clone(), log_sigma_noise.detach().clone()
-
+            prev_log_prior = log_prior_prec.detach().clone()
             hyper_optimizer.zero_grad()
 
             # Calculate negative marginal likelihood
-            neg_marglik = -self.log_marginal_likelihood(log_prior_prec.exp(), log_sigma_noise.exp())
+            #neg_marglik = -self.log_marginal_likelihood(log_prior_prec.exp(), log_sigma_noise.exp())
+            neg_marglik = -self.log_marginal_likelihood(log_prior_prec.exp())
             neg_marglik.backward(retain_graph=True)
 
             # Perform optimization step
             hyper_optimizer.step()
 
             # Calculate the error based on the change in hyperparameters
-            error = 0.5 * (torch.abs(log_prior_prec - prev_log_prior) + torch.abs(log_sigma_noise - prev_log_sigma)).item()
+            #error = 0.5 * (torch.abs(log_prior_prec - prev_log_prior) + torch.abs(log_sigma_noise - prev_log_sigma)).item()
+            error = torch.abs(log_prior_prec - prev_log_prior).item()
+
+            # --- NEW: Save current untransformed hyperparameters ---
+            #sigma_trace.append(log_sigma_noise.exp().item())
+            prior_trace.append(log_prior_prec.exp().item())
+            marglik_trace.append(-neg_marglik.item())
+
             n_iter += 1
 
             # Optional: log progress for monitoring
@@ -316,11 +358,13 @@ class dgala(torch.nn.Module):
                 print(f"Iteration {n_iter}, Error: {error:.5f}, neg_marglik: {neg_marglik.item():.5f}")
 
         self.prior_precision = log_prior_prec.detach().exp()
-        self.sigma_noise = log_sigma_noise.detach().exp()
+        #self.sigma_noise = log_sigma_noise.detach().exp()
 
         if n_iter == max_iter:
             print(f"Maximum iterations ({max_iter})reached, sigma : {self.sigma_noise.item()}, prior: {self.prior_precision.item()}.")
 
+        return sigma_trace, prior_trace, marglik_trace
+    
     # def optimize_marginal_likelihood(self, error_tolerance=1e-3, max_iter=300, lr=1e-2):
     #     """Optimize the log prior and log sigma by maximizing the marginal likelihood."""
     #     #log_prior_prec = self.prior_precision.log().requires_grad_(True)

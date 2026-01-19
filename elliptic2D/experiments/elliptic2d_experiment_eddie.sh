@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- Configuration ---
-VERBOSE=""
+VERBOSE="--verbose"
 MODEL_TYPE="dgala"  # Options: dgala, gp, pigp
 MARGINAL_APPROXIMATION=""
 PROPOSAL="--proposal random_walk"
